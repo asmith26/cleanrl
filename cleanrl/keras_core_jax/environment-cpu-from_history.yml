@@ -1,0 +1,13 @@
+name: cleanrl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - gymnasium
+  - ca-certificates
+  - openssl
+  - stable-baselines3
+  - jax
+  - certifi
+  - optax
+  - mujoco

@@ -9,3 +9,6 @@ env-cpu-create-from-lock:
 env-cpu-export:
 	mamba env export > environment-cpu.yml
 	mamba env export --from-history > environment-cpu-from_history.yml
+
+env-update:
+	mamba update --all

@@ -3,7 +3,7 @@ channels:
   - conda-forge
 dependencies:
   - _libgcc_mutex=0.1=conda_forge
-  - _openmp_mutex=4.5=2_gnu
+  - _openmp_mutex=4.5=2_kmp_llvm
   - absl-py=2.0.0=pyhd8ed1ab_0
   - aom=3.6.1=h59595ed_0
   - brotli=1.1.0=hd590300_1
@@ -76,8 +76,8 @@ dependencies:
   - libgfortran-ng=13.2.0=h69a702a_2
   - libgfortran5=13.2.0=ha4646dd_2
   - libglib=2.78.0=hebfc3b9_0
-  - libgomp=13.2.0=h807b86a_2
   - libgrpc=1.57.0=ha4d0f93_1
+  - libhwloc=2.9.3=default_h554bfaf_1009
   - libiconv=1.17=h166bdaf_0
   - libidn2=2.3.4=h166bdaf_0
   - libjpeg-turbo=3.0.0=hd590300_1
@@ -102,9 +102,11 @@ dependencies:
   - libxcb=1.15=h0b41bf4_0
   - libxml2=2.11.5=h232c23b_1
   - libzlib=1.2.13=hd590300_5
+  - llvm-openmp=17.0.2=h4dfa4b3_0
   - lodepng=20220109=h924138e_0
   - markupsafe=2.1.3=py311h459d7ec_1
   - matplotlib-base=3.8.0=py311h54ef318_1
+  - mkl=2022.2.1=h84fe81f_16997
   - ml_dtypes=0.2.0=py311h320fe9a_2
   - moviepy=1.0.3=pyhd8ed1ab_1
   - mpc=1.3.1=hfe3b2da_0
@@ -116,7 +118,6 @@ dependencies:
   - ncurses=6.4=hcb278e6_0
   - nettle=3.8.1=hc379101_1
   - networkx=3.1=pyhd8ed1ab_0
-  - nomkl=1.0=h5ca1d4c_0
   - numpy=1.26.0=py311h64a7726_0
   - openh264=2.3.1=hcb278e6_2
   - openjpeg=2.5.0=h488ebb8_3
@@ -142,7 +143,7 @@ dependencies:
   - python-dateutil=2.8.2=pyhd8ed1ab_0
   - python-tzdata=2023.3=pyhd8ed1ab_0
   - python_abi=3.11=4_cp311
-  - pytorch=2.0.0=cpu_generic_py311h59ffd09_2
+  - pytorch=2.0.0=cpu_mkl_py311h6acbe2c_102
   - pytz=2023.3.post1=pyhd8ed1ab_0
   - qhull=2020.2=h4bd325d_2
   - re2=2023.03.02=h8c504da_0
@@ -155,6 +156,7 @@ dependencies:
   - stable-baselines3=2.1.0=pyhd8ed1ab_0
   - svt-av1=1.7.0=h59595ed_0
   - sympy=1.12=pypyh9d50eac_103
+  - tbb=2021.10.0=h00ab1b0_1
   - tinyxml2=9.0.0=h9c3ff4c_2
   - tk=8.6.13=h2797004_0
   - toolz=0.12.0=pyhd8ed1ab_0
@@ -187,8 +189,6 @@ dependencies:
   - zlib=1.2.13=hd590300_5
   - zstd=1.5.5=hfc55251_0
   - pip:
-      - absl-py==2.0.0
-      - dm-tree==0.1.8
       - h5py==3.9.0
       - keras-core==0.1.7
       - markdown-it-py==3.0.0

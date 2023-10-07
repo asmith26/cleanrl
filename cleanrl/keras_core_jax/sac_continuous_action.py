@@ -45,16 +45,22 @@ class Args:
     autotune: bool = True  # automatic tuning of the entropy coefficient
 
 
-class Utils:
+class G:  # globals
+    envs = None
+    target_entropy = None
+    action_dim = None
+    obs_dim = None
     root_save_dir: str
 
+
+class Utils:
     @staticmethod
     def get_datetime() -> str:
         current_datetime = datetime.datetime.now()
         return current_datetime.strftime("%Y%m%d-%H%M%S")
 
     @classmethod
-    def update_model_state(cls, model_class):
+    def _update_model_state(cls, model_class):
         for variable, value in zip(model_class.model.trainable_variables, model_class.t):
             variable.assign(value)
         for variable, value in zip(model_class.model.non_trainable_variables, model_class.nt):
@@ -63,41 +69,49 @@ class Utils:
 
     @classmethod
     def update_models_state_and_save(cls, global_step: int, actor, critic, ent_coef):
-        actor = cls.update_model_state(actor)
-        actor.save(f"{cls.root_save_dir}/models/a_{global_step}.keras")
-        critic = cls.update_model_state(critic)
-        critic.save(f"{cls.root_save_dir}/models/c_{global_step}.keras")
-        ent_coef = cls.update_model_state(ent_coef)
-        ent_coef.save(f"{cls.root_save_dir}/models/ec_{global_step}.keras")
+        actor = cls._update_model_state(actor)
+        actor.save(f"{G.root_save_dir}/models/a_{global_step}.keras")
+        critic = cls._update_model_state(critic)
+        critic.save(f"{G.root_save_dir}/models/c_{global_step}.keras")
+        ent_coef = cls._update_model_state(ent_coef)
+        ent_coef.save(f"{G.root_save_dir}/models/ec_{global_step}.keras")
 
-
-class Env:
-    def __init__(self):
-        self.envs = DummyVecEnv([self.make_env(0)])
-        self.envs.observation_space.dtype = np.float32
-        assert isinstance(self.envs.action_space, gym.spaces.Box), "only continuous action space is supported"
-        self.action_dim = int(np.prod(self.envs.action_space.shape))
-        self.obs_dim = int(np.prod(self.envs.observation_space.shape))
-
-    def make_env(self, idx: int, run_name: str) -> Callable:
+    def _make_env(self, idx: int) -> Callable:
         def thunk():
             env = gym.make(Args.env_id)
             env = gym.wrappers.RecordEpisodeStatistics(env)
             if Args.capture_video:
                 if idx == 0:
-                    env = gym.wrappers.RecordVideo(env, f"{Utils.root_save_dir}/videos/")
+                    env = gym.wrappers.RecordVideo(env, f"{G.root_save_dir}/videos/")
             env.seed(Args.seed)
             env.action_space.seed(Args.seed)
             env.observation_space.seed(Args.seed)
             return env
+
         return thunk
 
+    def setup_envs(cls):
+        G.envs = DummyVecEnv([cls._make_env(0)])
+        G.envs.observation_space.dtype = np.float32
+        # assert isinstance(self.envs.action_space, gym.spaces.Box), "only continuous action space is supported"
+        G.action_dim = int(np.prod(G.envs.action_space.shape))
+        G.obs_dim = int(np.prod(G.envs.observation_space.shape))
+        G.target_entropy = -np.prod(G.envs.action_space.shape).astype(np.float32)
 
-class Critic:
+
+class BaseModel:
+    def __init__(self):
+        self.optimizer.build(self.model.trainable_variables)
+        self.t = self.model.trainable_variables
+        self.nt = self.model.non_trainable_variables
+        self.obs = self.optimizer.variables
+
+
+class Critic(BaseModel):
     def __init__(self):
         self.model = self.get_critic()
         self.optimizer = keras.optimizers.Adam(learning_rate=Args.q_lr)
-        self.optimizer.build(self.model.trainable_variables)
+        super(Critic, self).__init__()
 
     def get_critic(self) -> keras.Model:
         n_units = 256
@@ -140,11 +154,11 @@ class Critic:
 #         return q_values
 
 
-class Actor:
+class Actor(BaseModel):
     def __init__(self):
         self.model = self.get_actor()
         self.optimizer = keras.optimizers.Adam(learning_rate=Args.policy_lr)
-        self.optimizer.build(self.model.trainable_variables)
+        super(Actor, self).__init__()
 
     def get_actor(self) -> keras.Model:
         n_units = 256
@@ -200,13 +214,12 @@ class Actor:
         return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
 
-class EntropyCoef:
+class EntropyCoef(BaseModel):
     def __init__(self):
         self.model = self.get_entropy_coefficient()
         self.optimizer = keras.optimizers.Adam(learning_rate=Args.q_lr)
-        self.optimizer.build(self.trainable_variables)
         self.loss_fn = keras.losses.MeanSquaredError()
-        self.target_entropy = -np.prod(envs.action_space.shape).astype(np.float32)
+        super(EntropyCoef, self).__init__()
 
     def get_entropy_coefficient(self) -> keras.Model:
         ent_coef_init = 1.0
@@ -244,7 +257,7 @@ def main():
     np.random.seed(Args.seed)
     key = jax.random.PRNGKey(Args.seed)
     # Env
-    e = Env()
+    Utils.setup_envs()
     # Networks
     actor = Actor()
     critic = Actor()
@@ -257,8 +270,8 @@ def main():
     # TRY NOT TO MODIFY: start the game
     rb = ReplayBuffer(
         Args.buffer_size,
-        e.envs.observation_space,
-        e.envs.action_space,
+        G.envs.observation_space,
+        G.envs.action_space,
         device="cpu",   # force cpu device to easy torch -> numpy conversion
         handle_timeout_termination=True,
     )
@@ -301,7 +314,7 @@ def main():
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
-        # ALGO LOGIC: training.
+        # ALGO LOGIC: traininG.
         if global_step > Args.learning_starts:
             data = rb.sample(Args.batch_size)
 
@@ -370,7 +383,7 @@ def main():
             if global_step % Args.save_networks_interval == 0:
                 Utils.update_models_state_and_save(global_step, actor, critic, ent_coef)
 
-    e.envs.close()
+    G.envs.close()
     writer.close()
 
 

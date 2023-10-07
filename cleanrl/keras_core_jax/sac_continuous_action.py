@@ -5,6 +5,9 @@ import random
 import time
 from dataclasses import dataclass
 from typing import Callable, Tuple
+
+import optax
+
 os.environ["KERAS_BACKEND"] = "jax"
 
 from stable_baselines3.common.buffers import ReplayBuffer
@@ -45,12 +48,29 @@ class Args:
     autotune: bool = True  # automatic tuning of the entropy coefficient
 
 
-class G:  # globals
-    envs = None
-    target_entropy = None
-    action_dim = None
-    obs_dim = None
-    root_save_dir: str
+class BaseModel:
+    model: keras.Model
+    optimizer: keras.Optimizer
+
+    @jax.jit
+    def jitted_stateless_call(self, *args, **kwargs):
+        return self.model.stateless_call(*args, **kwargs)
+
+    def __init__(self):
+        self.optimizer.build(self.model.trainable_variables)
+        self.t = self.model.trainable_variables
+        self.nt = self.model.non_trainable_variables
+        self.ov = self.optimizer.variables
+        self.tt = None  # target
+        self.tnt = None  # target
+
+    def get_state(self, include_ov: bool = True, include_target=False):
+        state = [self.t, self.nt]
+        if include_ov:
+            state.append(self.ov)
+        if include_target:
+            state.extend([self.tt, self.tnt])
+        return state
 
 
 class Utils:
@@ -60,16 +80,16 @@ class Utils:
         return current_datetime.strftime("%Y%m%d-%H%M%S")
 
     @classmethod
-    def _update_model_state(cls, model_class):
-        for variable, value in zip(model_class.model.trainable_variables, model_class.t):
+    def _update_model_state(cls, model_instance: BaseModel):
+        for variable, value in zip(model_instance.model.trainable_variables, model_instance.t):
             variable.assign(value)
-        for variable, value in zip(model_class.model.non_trainable_variables, model_class.nt):
+        for variable, value in zip(model_instance.model.non_trainable_variables, model_instance.nt):
             variable.assign(value)
-        return model_class
+        return model_instance
 
     @classmethod
-    def update_models_state_and_save(cls, global_step: int, actor, critic, ent_coef):
-        actor = cls._update_model_state(actor)
+    def update_models_state_and_save(cls, global_step: int):
+        actor = cls._update_model_state(G.a)
         actor.save(f"{G.root_save_dir}/models/a_{global_step}.keras")
         critic = cls._update_model_state(critic)
         critic.save(f"{G.root_save_dir}/models/c_{global_step}.keras")
@@ -99,21 +119,16 @@ class Utils:
         G.target_entropy = -np.prod(G.envs.action_space.shape).astype(np.float32)
 
 
-class BaseModel:
-    def __init__(self):
-        self.optimizer.build(self.model.trainable_variables)
-        self.t = self.model.trainable_variables
-        self.nt = self.model.non_trainable_variables
-        self.obs = self.optimizer.variables
-
-
 class Critic(BaseModel):
     def __init__(self):
-        self.model = self.get_critic()
+        self.model = self.get_model()
         self.optimizer = keras.optimizers.Adam(learning_rate=Args.q_lr)
         super(Critic, self).__init__()
+        self.tt = self.model.trainable_variables
+        self.tnt =self.model.non_trainable_variables
 
-    def get_critic(self) -> keras.Model:
+
+    def get_model(self) -> keras.Model:
         n_units = 256
 
         observation_input = keras.Input(shape=(None, G.obs_dim), name="observation")
@@ -130,6 +145,46 @@ class Critic(BaseModel):
             outputs=q_value,
         )
         return model
+
+    @staticmethod
+    @jax.jit
+    def update(a_state, qf_state, ent_coef_value: jnp.ndarray,
+               observations: np.ndarray, actions: np.ndarray, next_observations: np.ndarray,
+               rewards: np.ndarray, dones: np.ndarray, key: jax.random.KeyArray):
+        key, subkey = jax.random.split(key, 2)
+        a_t, a_nt, a_ov = a_state
+        qf_t, qf_nt, qf_ov, qft_t, qft_nt = qf_state
+
+        (mean, log_std), a_nt = G.a.jitted_stateless_call(a_t, a_nt, next_observations)
+        next_state_actions, next_log_prob = Actor.sample_action_and_log_prob(mean, log_std, subkey)
+
+        qf_next_values, qft_nt = G.qf.jitted_stateless_call(qft_t, qft_nt, next_observations, next_state_actions)
+        next_q_values = jnp.min(qf_next_values, axis=0)
+        # td error + entropy term
+        next_q_values = next_q_values - ent_coef_value * next_log_prob.reshape(-1, 1)
+        # shape is (batch_size, 1)
+        target_q_values = rewards.reshape(-1, 1) + (1 - dones.reshape(-1, 1)) * Args.gamma * next_q_values
+
+        def mse_loss(_qf_t, _qf_nt):
+            # shape is (n_critics, batch_size, 1)
+            current_q_values, _qf_nt = G.qf.jitted_stateless_call(_qf_t, _qf_nt, observations, actions)
+            # mean over the batch and then sum for each critic
+            critic_loss = 0.5 * ((target_q_values - current_q_values) ** 2).mean(axis=1).sum()
+            return critic_loss, (_qf_nt, current_q_values.mean())
+
+        (qf_loss_value, (qf_nt, qf_values)), grads = jax.value_and_grad(mse_loss, has_aux=True)(qf_t, qf_nt)
+        qf_t, qf_ov = G.qf.optimizer.stateless_apply(qf_ov, grads, qf_t)
+
+        a_state = a_t, a_nt, a_ov
+        qf_state = qf_t, qf_nt, qf_ov, qft_t, qft_nt
+        return ((a_state, qf_state), (qf_loss_value, qf_values), key)
+
+    @staticmethod
+    @jax.jit
+    def soft_update(qf_t, qf_nt, qft_t, qft_nt):
+        qft_t = optax.incremental_update(qf_t, qft_t, Args.tau)
+        qft_nt = optax.incremental_update(qf_nt, qft_nt, Args.tau)
+        return qft_t, qft_nt
 
 
 # class VectorCritic(nn.Module):
@@ -156,11 +211,11 @@ class Critic(BaseModel):
 
 class Actor(BaseModel):
     def __init__(self):
-        self.model = self.get_actor()
+        self.model = self.get_model()
         self.optimizer = keras.optimizers.Adam(learning_rate=Args.policy_lr)
         super(Actor, self).__init__()
 
-    def get_actor(self) -> keras.Model:
+    def get_model(self) -> keras.Model:
         n_units = 256
         log_std_min: float = -20
         log_std_max: float = 2
@@ -182,13 +237,25 @@ class Actor(BaseModel):
 
     @staticmethod
     @jax.jit
-    def sample_action(t, nt, observations: jnp.ndarray, key: jax.random.KeyArray) -> Tuple[jnp.array, list, jnp.array]:
+    def sample_action(state, observations: jnp.ndarray, key: jax.random.KeyArray) -> Tuple[jnp.array, list, jnp.array]:
+        t, nt, _ = state
         key, subkey = jax.random.split(key, 2)
-        (mean, log_std), nt = G.s_a_m.stateless_call(t, nt, observations, training=False)
+        (mean, log_std), nt = G.a.model.stateless_call(t, nt, observations, training=False)
         action_std = jnp.exp(log_std)
         gaussian_action = mean + action_std * jax.random.normal(subkey, shape=mean.shape)
         action = jnp.tanh(gaussian_action)
         return action, nt, key
+
+    @staticmethod
+    @jax.jit
+    def sample_action_and_log_prob(mean: jnp.ndarray, log_std: jnp.ndarray, subkey: jax.random.KeyArray):
+        action_std = jnp.exp(log_std)
+        gaussian_action = mean + action_std * jax.random.normal(subkey, shape=mean.shape)
+        log_prob = -0.5 * ((gaussian_action - mean) / action_std) ** 2 - 0.5 * jnp.log(2.0 * jnp.pi) - log_std
+        log_prob = log_prob.sum(axis=1)
+        action = jnp.tanh(gaussian_action)
+        log_prob -= jnp.sum(jnp.log((1 - action ** 2) + 1e-6), 1)
+        return action, log_prob
 
     @staticmethod
     def scale_action(action_space: gym.spaces.Box, action: np.ndarray) -> np.ndarray:
@@ -213,15 +280,39 @@ class Actor(BaseModel):
         low, high = action_space.low, action_space.high
         return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
+    @staticmethod
+    @jax.jit
+    def update(a_state, qf_state, ent_coef_value: jnp.ndarray,
+               observations: np.ndarray, key: jax.random.KeyArray):
+        key, subkey = jax.random.split(key, 2)
+        a_t, a_nt, a_ov = a_state
+        qf_t, qf_nt, qf_ov = qf_state
+
+        def actor_loss(_a_t, _a_nt, _qf_t, _qf_nt):
+            (mean, log_std), _a_nt = G.a.jitted_stateless_call(_a_t, _a_nt, observations)
+            actions, log_prob = Actor.sample_action_and_log_prob(mean, log_std, subkey)
+            qf_pi, _qf_nt = G.qf.jitted_stateless_call(_qf_t, _qf_nt, observations, actions)
+            # Take min among all critics
+            min_qf_pi = jnp.min(qf_pi, axis=0)
+            actor_loss = (ent_coef_value * log_prob - min_qf_pi).mean()
+            return actor_loss, (_a_nt, _qf_nt, -log_prob.mean())
+
+        (actor_loss_value, (a_nt, qf_nt, entropy)), grads = jax.value_and_grad(actor_loss, has_aux=True)(a_t, a_nt)
+        a_t, a_ov = G.a.optimizer.stateless_apply(a_ov, grads, a_t)
+
+        a_state = a_t, a_nt, a_ov
+        qf_state = qf_t, qf_nt, qf_ov
+        return a_state, qf_state, actor_loss_value, key, entropy
+
 
 class EntropyCoef(BaseModel):
     def __init__(self):
-        self.model = self.get_entropy_coefficient()
+        self.model = self.get_model()
         self.optimizer = keras.optimizers.Adam(learning_rate=Args.q_lr)
         self.loss_fn = keras.losses.MeanSquaredError()
         super(EntropyCoef, self).__init__()
 
-    def get_entropy_coefficient(self) -> keras.Model:
+    def get_model(self) -> keras.Model:
         ent_coef_init = 1.0
         log_ent_coef = jnp.full((), jnp.log(ent_coef_init))
         ent_coef = keras.Model(inputs=[],
@@ -229,19 +320,30 @@ class EntropyCoef(BaseModel):
         return ent_coef
 
     @staticmethod
-    def train_step(self, entropy: float):
-        t, nt, ov, mv = self.state
-        def temperature_loss():
-            ent_coef_value, nt = self.stateless_call(t, nt, training=True)
+    def update(state, entropy: float):
+        t, nt, ov = state
+        
+        def temperature_loss(_t, _nt):
+            ent_coef_value, _nt = G.ec.model.stateless_call(_t, _nt, training=True)
             ent_coef_loss = ent_coef_value * (entropy - G.target_entropy).mean()
-            return ent_coef_loss, nt
+            return ent_coef_loss, _nt
 
-        grad_fn = jax.value_and_grad(temperature_loss, has_aux=True)
-        (ent_coef_loss, nt), grads = grad_fn()
-        t, ov = self.optimizer.stateless_apply(ov, grads, t)
+        (ent_coef_loss, nt), grads = jax.value_and_grad(temperature_loss, has_aux=True)()
+        t, ov = G.ec.optimizer.stateless_apply(ov, grads, t)
 
-        state = t, nt, ov, mv
+        state = t, nt, ov
         return ent_coef_loss, state
+
+
+class G:  # globals
+    a: Actor
+    qf: Critic
+    ec: EntropyCoef
+    target_entropy: np.ndarray
+    root_save_dir: str
+    action_dim: int
+    obs_dim: int
+    envs: DummyVecEnv
 
 
 def main():
@@ -259,11 +361,11 @@ def main():
     # Env
     Utils.setup_envs()
     # Networks
-    actor = Actor()
-    critic = Actor()
+    G.a = Actor()
+    G.qf = Critic()
     # automatic entropy tuning
     if Args.autotune:
-        ent_coef = EntropyCoef(0)
+        G.ec = EntropyCoef()
     else:
         ent_coef_value = jnp.array(Args.alpha)
 
@@ -275,22 +377,22 @@ def main():
         device="cpu",   # force cpu device to easy torch -> numpy conversion
         handle_timeout_termination=True,
     )
-    obs = e.envs.reset()
+    obs = G.envs.reset()
     start_time = time.time()
     for global_step in tqdm(range(1, Args.total_timesteps+1)):
         # ALGO LOGIC: put action logic here
         if global_step < Args.learning_starts:
-            actions = np.array([e.envs.action_space.sample() for _ in range(e.envs.num_envs)])
+            actions = np.array([G.envs.action_space.sample() for _ in range(G.envs.num_envs)])
         else:
-            actions, key = actor.sample_action(obs, key)
+            actions, key = G.a.sample_action(obs, key)
             actions = np.array(actions)
             # Clip due to numerical instability
             actions = np.clip(actions, -1, 1)
             # Rescale to proper domain when using squashing
-            actions = actor.unscale_action(e.envs.action_space, actions)
+            actions = G.a.unscale_action(G.envs.action_space, actions)
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, dones, infos = e.envs.step(actions)
+        next_obs, rewards, dones, infos = G.envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         for info in infos:
@@ -308,7 +410,7 @@ def main():
                 real_next_obs[idx] = infos[idx]["terminal_observation"]
 
         # Store the scaled action
-        scaled_actions = actor.scale_action(e.envs.action_space, actions)
+        scaled_actions = G.a.scale_action(G.envs.action_space, actions)
         rb.add(obs, real_next_obs, actions, rewards, dones, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -318,23 +420,12 @@ def main():
         if global_step > Args.learning_starts:
             data = rb.sample(Args.batch_size)
 
-
-
-
-
-
-
-
-
-
-
-
             if Args.autotune:
-                ent_coef_value = ent_coef.apply({"params": ent_coef_state.params})
+                ent_coef_value, G.ec.nt = G.ec.jitted_stateless_call(G.ec.get_state(include_ov=False))
 
-            qf_state, (qf_loss_value, qf_values), key = update_critic(
-                actor_state,
-                qf_state,
+            ((a_state, qf_state), (qf_loss_value, qf_values), key) = Critic.update(
+                G.a.get_state(),
+                G.qf.get_state(include_target=True),
                 ent_coef_value,
                 data.observations.numpy(),
                 data.actions.numpy(),
@@ -343,32 +434,25 @@ def main():
                 data.dones.numpy(),
                 key,
             )
-
+            G.a.t, G.a.nt, G.a.ov = a_state
+            G.qf.t, G.qf.nt, G.qf.ov. G.qf.tt, G.qf.tnt = qf_state
             if global_step % Args.policy_frequency == 0:  # TD 3 Delayed update support
-                (actor_state, qf_state, actor_loss_value, key, entropy) = update_actor(
-                    actor_state,
-                    qf_state,
+                (a_state, qf_state, actor_loss_value, key, entropy) = Actor.update(
+                    G.a.get_state(),
+                    G.qf.get_state(),
                     ent_coef_value,
                     data.observations.numpy(),
                     key,
                 )
+                G.a.t, G.a.nt, G.a.ov = a_state
+                G.qf.t, G.qf.nt, G.qf.ov = qf_state
 
                 if Args.autotune:
-                    ent_coef_state, ent_coef_loss = update_temperature(ent_coef_state, entropy)
+                    ent_coef_state, ent_coef_loss = EntropyCoef.update(G.ec.get_state(), entropy)
 
             # update the target networks
             if global_step % Args.target_network_frequency == 0:
-                qf_state = soft_update(Args.tau, qf_state)
-
-
-
-
-
-
-
-
-
-
+                G.qf.tt, G.qf.tnt = Critic.soft_update(G.qf.t, G.qf.tt,  G.qf.tt, G.qf.tnt)
 
             if global_step % 100 == 0:
                 writer.add_scalar("losses/qf_values", qf_values.mean().item(), global_step)
@@ -381,7 +465,7 @@ def main():
                 if Args.autotune:
                     writer.add_scalar("losses/alpha_loss", ent_coef_loss.item(), global_step)
             if global_step % Args.save_networks_interval == 0:
-                Utils.update_models_state_and_save(global_step, actor, critic, ent_coef)
+                Utils.update_models_state_and_save(global_step)
 
     G.envs.close()
     writer.close()

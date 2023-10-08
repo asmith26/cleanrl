@@ -325,7 +325,7 @@ class EntropyCoefLayer(keras.layers.Layer):
     def __init__(self):
         super(EntropyCoefLayer, self).__init__()
         self.log_ent_coef = self.add_weight(
-            shape=(),
+            shape=(1, 1),
             initializer="zero",
             trainable=True,
         )
@@ -342,10 +342,9 @@ class EntropyCoef(BaseModel):
         super(EntropyCoef, self).__init__()
 
     def get_model(self) -> keras.Model:
-        no_input = keras.Input(shape=())
-        out = EntropyCoefLayer()(no_input)
-        ent_coef = keras.Model(inputs=no_input,
-                               outputs=out)
+        inputs = keras.Input(shape=())
+        outputs = EntropyCoefLayer()(inputs)
+        ent_coef = keras.Model(inputs=inputs, outputs=outputs)
         return ent_coef
 
     @staticmethod

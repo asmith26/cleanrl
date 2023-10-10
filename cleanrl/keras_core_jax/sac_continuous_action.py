@@ -4,10 +4,13 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
 from typing import Callable, Tuple
 
 import optax
-
+# from jax.config import config
+# config.update('jax_disable_jit', True)
 os.environ["KERAS_BACKEND"] = "jax"
 
 from stable_baselines3.common.buffers import ReplayBuffer
@@ -52,7 +55,7 @@ class BaseModel:
     model: keras.Model
     optimizer: keras.Optimizer
 
-    # @jax.jit
+    @partial(jax.jit, static_argnums=(0,))
     def jitted_stateless_call(self, *args, **kwargs):
         return self.model.stateless_call(*args, **kwargs)
 
@@ -89,6 +92,7 @@ class Utils:
 
     @classmethod
     def update_models_state_and_save(cls, global_step: int):
+        (G.root_save_dir / "models").mkdir(parents=True, exist_ok=True)
         a = cls._update_model_state(G.a)
         a.model.save(f"{G.root_save_dir}/models/a_{global_step}.keras")
         qf1 = cls._update_model_state(G.qf1)
@@ -250,7 +254,7 @@ class Actor(BaseModel):
     @staticmethod
     @jax.jit
     def sample_action(state, observations: jnp.ndarray, key: jax.random.KeyArray) -> Tuple[jnp.array, list, jnp.array]:
-        t, nt, _ = state
+        t, nt = state
         key, subkey = jax.random.split(key, 2)
         (mean, log_std), nt = G.a.model.stateless_call(t, nt, observations, training=False)
         action_std = jnp.exp(log_std)
@@ -369,15 +373,15 @@ class G:  # globals
     qf2: Critic
     ec: EntropyCoef
     target_entropy: np.ndarray
-    root_save_dir: str
+    root_save_dir: Path
     action_dim: int
     obs_dim: int
     envs: DummyVecEnv
 
 
 def main():
-    G.root_save_dir = f"runs/{Args.env_id}__{Args.seed}__{Utils.get_datetime()}"
-    writer = SummaryWriter(G.root_save_dir)
+    G.root_save_dir = Path(f"runs/{Args.env_id}__{Args.seed}__{Utils.get_datetime()}")
+    writer = SummaryWriter(str(G.root_save_dir))
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in Args.__dict__.items()])),
@@ -414,7 +418,7 @@ def main():
         if global_step < Args.learning_starts:
             actions = np.array([G.envs.action_space.sample() for _ in range(G.envs.num_envs)])
         else:
-            actions, G.a.nt, key = Actor.sample_action(G.a.get_state(), obs, key)
+            actions, G.a.nt, key = Actor.sample_action(G.a.get_state(include_ov=False), obs, key)
             actions = np.array(actions)
             # Clip due to numerical instability
             actions = np.clip(actions, -1, 1)
@@ -451,7 +455,7 @@ def main():
             data = rb.sample(Args.batch_size)
 
             if Args.autotune:
-                ent_coef_value, G.ec.nt = G.ec.jitted_stateless_call(*G.ec.get_state(include_ov=False), jnp.array([]))
+                ent_coef_value, G.ec.nt = G.ec.jitted_stateless_call(G.ec.t, G.ec.nt, jnp.array([]))
 
             ((a_state, qf1_state, qf2_state), (qf_loss_value, qf_values), key) = Critic.update(
                 G.a.get_state(),

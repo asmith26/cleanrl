@@ -148,7 +148,7 @@ class Critic(BaseModel):
         return model
 
     @staticmethod
-    # @jax.jit
+    @jax.jit
     def update(a_state, qf1_state, qf2_state, ent_coef_value: jnp.ndarray,
                observations: np.ndarray, actions: np.ndarray, next_observations: np.ndarray,
                rewards: np.ndarray, dones: np.ndarray, key: jax.random.KeyArray):
@@ -190,7 +190,7 @@ class Critic(BaseModel):
         return ((a_state, qf1_state, qf2_state), (qf_loss_value, qf_values), key)
 
     @staticmethod
-    # @jax.jit
+    @jax.jit
     def soft_update(qf1_t, qf1_nt, qf1_tt, qf1_tnt, qf2_t, qf2_nt, qf2_tt, qf2_tnt):
         qf1_tt = optax.incremental_update(qf1_t, qf1_tt, Args.tau)
         qf1_tnt = optax.incremental_update(qf1_nt, qf1_tnt, Args.tau)
@@ -248,7 +248,7 @@ class Actor(BaseModel):
         return model
 
     @staticmethod
-    # @jax.jit
+    @jax.jit
     def sample_action(state, observations: jnp.ndarray, key: jax.random.KeyArray) -> Tuple[jnp.array, list, jnp.array]:
         t, nt, _ = state
         key, subkey = jax.random.split(key, 2)
@@ -259,7 +259,7 @@ class Actor(BaseModel):
         return action, nt, key
 
     @staticmethod
-    # @jax.jit
+    @jax.jit
     def sample_action_and_log_prob(mean: jnp.ndarray, log_std: jnp.ndarray, subkey: jax.random.KeyArray):
         action_std = jnp.exp(log_std)
         gaussian_action = mean + action_std * jax.random.normal(subkey, shape=mean.shape)
@@ -293,7 +293,7 @@ class Actor(BaseModel):
         return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
     @staticmethod
-    # @jax.jit
+    @jax.jit
     def update(a_state, qf1_state, qf2_state, ent_coef_value: jnp.ndarray,
                observations: np.ndarray, key: jax.random.KeyArray):
         key, subkey = jax.random.split(key, 2)
@@ -325,13 +325,13 @@ class EntropyCoefLayer(keras.layers.Layer):
     def __init__(self):
         super(EntropyCoefLayer, self).__init__()
         self.log_ent_coef = self.add_weight(
-            shape=(1, 1),
+            shape=(),
             initializer="zero",
             trainable=True,
         )
 
     def call(self, no_input):
-        return keras.ops.exp(self.log_ent_coef)
+        return keras.ops.exp(self.log_ent_coef.value)
 
 
 class EntropyCoef(BaseModel):
@@ -482,7 +482,7 @@ def main():
                 G.qf2.t, G.qf2.nt, G.qf2.ov = qf2_state
 
                 if Args.autotune:
-                    ent_coef_state, ent_coef_loss = EntropyCoef.update(G.ec.get_state(), entropy)
+                    ent_coef_loss, ent_coef_state = EntropyCoef.update(G.ec.get_state(), entropy)
 
             # update the target networks
             if global_step % Args.target_network_frequency == 0:

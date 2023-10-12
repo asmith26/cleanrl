@@ -402,7 +402,6 @@ class EntropyCoef(BaseModel):
     def __init__(self):
         self.model = self.get_model()
         self.optimizer = keras.optimizers.Adam(learning_rate=Args.q_lr)
-        self.loss_fn = keras.losses.MeanSquaredError()
         super(EntropyCoef, self).__init__()
 
     def get_model(self) -> keras.Model:
@@ -547,7 +546,8 @@ def main():
                 G.qf2.t, G.qf2.nt, G.qf2.ov = qf2_state
 
                 if Args.autotune:
-                    ent_coef_loss, ent_coef_state = EntropyCoef.update(G.ec.get_state(), entropy)
+                    ent_coef_loss, ec_state = EntropyCoef.update(G.ec.get_state(), entropy)
+                    G.ec.t, G.ec.nt, G.ec.ov = ec_state
 
             # update the target networks
             if global_step % Args.target_network_frequency == 0:

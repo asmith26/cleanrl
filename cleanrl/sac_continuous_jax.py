@@ -1,3 +1,6 @@
+import os
+os.environ["KERAS_BACKEND"] = "jax"
+import keras_core as keras
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 # Implementation adapted from https://github.com/araffin/sbx
 import argparse
@@ -30,6 +33,104 @@ try:
     from tqdm.rich import tqdm
 except ImportError:
     tqdm = None
+
+
+@dataclass
+class Args:
+    seed: int = 1  # seed of the experiment
+    env_id: str = "HalfCheetah-v4"  # the id of the environment
+    save_networks_interval = 50_00  # run this many steps then save networks
+    # --- Eval ---
+    capture_gifs: bool = True  # capture gifs of the agent performances (`gifs` folder)
+    eval_freq: int = 2_000 # evaluate the agent every `eval_freq` steps (if negative, no evaluation)
+    n_eval_episodes: int = 3  # number of episodes to use for evaluation
+    # --- Algorithm specific arguments ---
+    total_timesteps: int = 1_000_000  # total timesteps of the experiments
+    buffer_size: int = 1_000_000  # the replay memory buffer size
+    gamma: float = 0.99  # the discount factor gamma
+    tau: float = 0.005  # target smoothing coefficient
+    batch_size: int = 256  # the batch size of sample from the replay memory
+    learning_starts: int = 5_000  # timestep to start learning
+    policy_lr: float = 3e-4  # the learning rate of the policy network optimizer
+    q_lr: float = 1e-3  # the learning rate of the Q network network optimizer
+    n_critics: int = 2  # the number of critic networks
+    policy_frequency: int = 1  # the frequency of training policy (delayed)
+    target_network_frequency: int = 1  # the frequency of updates for the target networks
+    alpha: float = 0.2  # entropy regularization coefficient.
+    autotune: bool = True  # automatic tuning of the entropy coefficient
+
+
+class EntropyCoefLayer(keras.layers.Layer):
+    def __init__(self):
+        super(EntropyCoefLayer, self).__init__()
+        self.log_ent_coef = self.add_weight(
+            shape=(),
+            initializer="zero",
+            trainable=True,
+        )
+
+    def call(self, no_input):
+        return keras.ops.exp(self.log_ent_coef.value)
+
+
+class BaseModel:
+    model: keras.Model
+    optimizer: keras.Optimizer
+
+    @partial(jax.jit, static_argnums=(0,))
+    def jitted_stateless_call(self, *args, **kwargs):
+        return self.model.stateless_call(*args, **kwargs)
+
+    def __init__(self):
+        self.optimizer.build(self.model.trainable_variables)
+        self.t = self.model.trainable_variables
+        self.nt = self.model.non_trainable_variables
+        self.ov = self.optimizer.variables
+        self.tt = None  # target
+        self.tnt = None  # target
+
+    def get_state(self, include_ov: bool = True, include_target=False):
+        state = [self.t, self.nt]
+        if include_ov:
+            state.append(self.ov)
+        if include_target:
+            state.extend([self.tt, self.tnt])
+        return tuple(state)
+
+
+class EntropyCoef(BaseModel):
+    def __init__(self):
+        self.model = self.get_model()
+        self.optimizer = keras.optimizers.Adam(learning_rate=Args.q_lr)
+        super(EntropyCoef, self).__init__()
+
+    def get_model(self) -> keras.Model:
+        inputs = keras.Input(shape=())
+        outputs = EntropyCoefLayer()(inputs)
+        ent_coef = keras.Model(inputs=inputs, outputs=outputs)
+        return ent_coef
+
+    @staticmethod
+    def update(state, entropy: float):
+        t, nt, ov = state
+
+        def temperature_loss(_t, _nt):
+            ent_coef_value, _nt = G.ec.jitted_stateless_call(_t, _nt, jnp.array([]))
+            ent_coef_loss = ent_coef_value * (entropy - G.target_entropy).mean()
+            return ent_coef_loss, _nt
+
+        (ent_coef_loss, nt), grads = jax.value_and_grad(temperature_loss, has_aux=True)(t, nt)
+        t, ov = G.ec.optimizer.stateless_apply(ov, grads, t)
+
+        state = t, nt, ov
+        return ent_coef_loss, state
+
+
+@dataclass
+class G:  # globals
+    target_entropy = np.array(-6, dtype=np.float32)
+    ec = EntropyCoef()
+
 
 
 def parse_args():
@@ -472,7 +573,9 @@ if __name__ == "__main__":
             data = rb.sample(args.batch_size)
 
             if args.autotune:
-                ent_coef_value = ent_coef.apply({"params": ent_coef_state.params})
+                _ent_coef_value = ent_coef.apply({"params": ent_coef_state.params})
+                ent_coef_value, G.ec.nt = G.ec.jitted_stateless_call(G.ec.t, G.ec.nt, jnp.array([]))
+
 
             qf_state, (qf_loss_value, qf_values), key = update_critic(
                 actor_state,
@@ -498,7 +601,9 @@ if __name__ == "__main__":
                 )
 
                 if args.autotune:
-                    ent_coef_state, ent_coef_loss = update_temperature(ent_coef_state, entropy)
+                    _ent_coef_state, _ent_coef_loss = update_temperature(ent_coef_state, entropy)
+                    ent_coef_loss, ec_state = EntropyCoef.update(G.ec.get_state(), entropy)
+                    G.ec.t, G.ec.nt, G.ec.ov = ec_state
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:

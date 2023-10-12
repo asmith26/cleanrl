@@ -6,17 +6,12 @@ import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable, Tuple
+from typing import Tuple
 
-import optax
-# from jax.config import config
-# config.update('jax_disable_jit', True)
 os.environ["KERAS_BACKEND"] = "jax"
-
-from stable_baselines3.common.buffers import ReplayBuffer
+import optax
 from stable_baselines3.common.vec_env import DummyVecEnv
-
-
+from stable_baselines3.common.buffers import ReplayBuffer
 import jax
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
@@ -29,12 +24,12 @@ import jax.numpy as jnp
 @dataclass
 class Args:
     seed: int = 1  # seed of the experiment
-    capture_video: bool = True  # capture videos of the agent performances (`videos` folder)
     env_id: str = "HalfCheetah-v4"  # the id of the environment
-    save_networks_interval = 50_000  # run this many steps then save networks
-    # eval_freq: int = -1  # evaluate the agent every `eval_freq` steps (if negative, no evaluation)
-    # n_eval_episodes: int = 10  # number of episodes to use for evaluation
-    # n_eval_envs: int = 5  # number of environments for evaluation
+    save_networks_interval = 50_00  # run this many steps then save networks
+    # --- Eval ---
+    capture_gifs: bool = True  # capture gifs of the agent performances (`gifs` folder)
+    eval_freq: int = 2_000 # evaluate the agent every `eval_freq` steps (if negative, no evaluation)
+    n_eval_episodes: int = 3  # number of episodes to use for evaluation
     # --- Algorithm specific arguments ---
     total_timesteps: int = 1_000_000  # total timesteps of the experiments
     buffer_size: int = 1_000_000  # the replay memory buffer size
@@ -78,6 +73,14 @@ class BaseModel:
 
 class Utils:
     @staticmethod
+    def _save_gif(frames: list, global_step: int, episode_num: int) -> None:
+        import imageio
+        (out_dir := (G.root_save_dir / "gifs")).mkdir(parents=True, exist_ok=True)
+
+        img_list = [imageio.read(frame) for frame in frames]
+        imageio.mimsave(out_dir / f"{global_step}_{episode_num}.gif", img_list, fps=0.8)
+
+    @staticmethod
     def get_datetime() -> str:
         current_datetime = datetime.datetime.now()
         return current_datetime.strftime("%Y%m%d-%H%M%S")
@@ -103,28 +106,68 @@ class Utils:
         ec.model.save(f"{G.root_save_dir}/models/ec_{global_step}.keras")
 
     @classmethod
-    def _make_env(cls, idx: int) -> Callable:
-        def thunk():
+    def _make_env(cls, is_eval: bool=False) -> gym.Env:
+        if is_eval and Args.capture_gifs:
             env = gym.make(Args.env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordEpisodeStatistics(env)
-            if Args.capture_video:
-                if idx == 0:
-                    env = gym.wrappers.RecordVideo(env, f"{G.root_save_dir}/videos/")
-            # env.seed(Args.seed)
-            env.action_space.seed(Args.seed)
-            env.observation_space.seed(Args.seed)
-            return env
+        else:
+            env = gym.make(Args.env_id)
+        # env = gym.wrappers.RecordEpisodeStatistics(env)
+        env.action_space.seed(Args.seed)
+        env.observation_space.seed(Args.seed)
+        env.observation_space.dtype = np.float32
+        # assert isinstance(self.envs.action_space, gym.spaces.Box), "only continuous action space is supported"
+        return env
 
-        return thunk
 
     @classmethod
     def setup_envs(cls):
-        G.envs = DummyVecEnv([cls._make_env(0)])
-        G.envs.observation_space.dtype = np.float32
+        G.envs = DummyVecEnv([lambda: cls._make_env()])
+        G.eval_env = cls._make_env(is_eval=True)
         # assert isinstance(self.envs.action_space, gym.spaces.Box), "only continuous action space is supported"
         G.action_dim = int(np.prod(G.envs.action_space.shape))
         G.obs_dim = int(np.prod(G.envs.observation_space.shape))
         G.target_entropy = -np.prod(G.envs.action_space.shape).astype(np.float32)
+
+    @classmethod
+    def _draw_text(cls, frame: np.ndarray, step: int, reward: float, terminated: bool, truncated: bool):
+        from PIL import Image, ImageDraw, ImageFont
+        image = Image.fromarray(frame)
+        draw = ImageDraw.Draw(image)
+        text = f"step: {step}\n" \
+               f"reward: {reward}\n" \
+               f"terminated: {terminated}\n" \
+               f"truncated: {truncated}"
+        position = (50, 50)  # (x, y) coordinates of the top-left corner
+        font = ImageFont.load_default()
+        text_color = (255, 255, 255)  # White color in RGB
+        draw.text(position, text, fill=text_color, font=font)
+        return np.array(image)
+
+    @classmethod
+    def _save_gif(cls, frames: list, global_step: int, eval_episode: int, episode_reward: float):
+        import imageio
+        (out_dir := (Path(f"{G.root_save_dir}") / "gifs")).mkdir(parents=True, exist_ok=True)
+        imageio.mimwrite(out_dir / f"{global_step}_{eval_episode}_r={episode_reward}.gif", frames, duration=20)
+
+    @classmethod
+    def evaluate(cls, global_step: int):
+        for eval_episode in range(Args.n_eval_episodes):
+            episode_reward = 0.0
+            frames = []
+            terminated = False; truncated = False
+            observation, info = G.eval_env.reset()
+            step = 0
+            while not (terminated or truncated):
+                action = G.a.predict(np.expand_dims(observation, axis=0))[0][0]
+                observation, reward, terminated, truncated, info = G.eval_env.step(action)
+                frames.append(cls._draw_text(G.eval_env.render(), step, reward, terminated, truncated))
+                episode_reward += float(reward)
+                step += 1
+            cls._save_gif(frames, global_step, eval_episode, episode_reward)
+            print("EVALUATION COMPLETE:"
+                  f" global_step={global_step},"
+                  f" eval_episode={eval_episode},"
+                  f" episode_reward={episode_reward}")
 
 
 class Critic(BaseModel):
@@ -230,6 +273,23 @@ class Actor(BaseModel):
         self.model = self.get_model()
         self.optimizer = keras.optimizers.Adam(learning_rate=Args.policy_lr)
         super(Actor, self).__init__()
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _select_action(self, observation: jnp.ndarray) -> jnp.array:
+        return self.jitted_stateless_call(self.t, self.nt, observation)[0]
+
+    def predict(self, observation: np.ndarray, deterministic=True):
+        # if deterministic:
+        action = self._select_action(observation)
+        # else:
+        #     actions, self.key = Actor.sample_action(self.actor, self.actor_state, observations, self.key)
+
+        # Clip due to numerical instability
+        action = np.clip(action, -1, 1)
+        # Rescale to proper domain when using squashing
+        action = self.unscale_action(G.envs.action_space, action)
+
+        return action
 
     def get_model(self) -> keras.Model:
         n_units = 256
@@ -376,7 +436,8 @@ class G:  # globals
     root_save_dir: Path
     action_dim: int
     obs_dim: int
-    envs: DummyVecEnv
+    envs: gym.Env
+    eval_env: gym.Env
 
 
 def main():
@@ -504,6 +565,9 @@ def main():
                     writer.add_scalar("losses/alpha_loss", ent_coef_loss.item(), global_step)
             if global_step % Args.save_networks_interval == 0:
                 Utils.update_models_state_and_save(global_step)
+
+            if global_step % Args.eval_freq == 0:
+                Utils.evaluate(global_step)
 
     G.envs.close()
     writer.close()

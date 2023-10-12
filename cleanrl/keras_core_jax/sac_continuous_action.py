@@ -25,10 +25,10 @@ import jax.numpy as jnp
 class Args:
     seed: int = 1  # seed of the experiment
     env_id: str = "HalfCheetah-v4"  # the id of the environment
-    save_networks_interval = 50_00  # run this many steps then save networks
+    save_networks_interval = 100_000  # run this many steps then save networks
     # --- Eval ---
     capture_gifs: bool = True  # capture gifs of the agent performances (`gifs` folder)
-    eval_freq: int = 2_000 # evaluate the agent every `eval_freq` steps (if negative, no evaluation)
+    eval_freq: int = 200_000 # evaluate the agent every `eval_freq` steps (if negative, no evaluation)
     n_eval_episodes: int = 3  # number of episodes to use for evaluation
     # --- Algorithm specific arguments ---
     total_timesteps: int = 1_000_000  # total timesteps of the experiments
@@ -496,7 +496,6 @@ def main():
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                 break
 
-
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
         for idx, d in enumerate(dones):
@@ -504,13 +503,13 @@ def main():
                 real_next_obs[idx] = infos[idx]["terminal_observation"]
 
         # Store the scaled action
-        scaled_actions = G.a.scale_action(G.envs.action_space, actions)  # todo with and without scaled_action in rb
+        # scaled_actions = G.a.scale_action(G.envs.action_space, actions)  # todo with and without scaled_action in rb
         rb.add(obs, real_next_obs, actions, rewards, dones, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
 
-        # ALGO LOGIC: traininG.
+        # ALGO LOGIC: training.
         if global_step > Args.learning_starts:
             data = rb.sample(Args.batch_size)
 

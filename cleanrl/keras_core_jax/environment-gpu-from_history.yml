@@ -1,0 +1,12 @@
+name: cleanrl
+channels:
+  - conda-forge
+dependencies:
+  - pip
+  - python=3.11
+  - gymnasium
+  - stable-baselines3
+  - optax
+  - mujoco
+  - moviepy
+  - tensorboard
